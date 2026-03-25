@@ -1,11 +1,10 @@
 #include "ASTHelperVisitors.h"
 #include "TidyDiags.h"
 #include "fmt/color.h"
+// #include <iostream>
 
 #include "slang/ast/ASTVisitor.h"
 #include "slang/syntax/AllSyntax.h"
-
-#include <iostream>
 
 using namespace slang;
 using namespace slang::ast;
@@ -17,9 +16,7 @@ struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, VisitFlags::All
     explicit MainVisitor(Diagnostics& diagnostics) : TidyVisitor(diagnostics) {}
 
 private:
-    bool is_macro{false};
     std::size_t prev_stmt_line{};
-    std::size_t prev_stmt_column{};
     StatementKind prev_stmt_kind{StatementKind::Invalid};
 
     const SyntaxNode* elseSyntax(const ConditionalStatement& stmt) {
@@ -77,9 +74,7 @@ private:
             case_start_line{sourceManager->getLineNumber(case_start)},
             case_end_line{sourceManager->getLineNumber(case_end)},
             case_start_column{sourceManager->getColumnNumber(case_start)},
-            is_macro_case_start{sourceManager->isMacroLoc(case_start)},
-            is_macro_case_end{sourceManager->isMacroLoc(case_end)},
-            is_macro_stmt_end{sourceManager->isMacroLoc(stmt->sourceRange.end())} {}
+            is_macro_case_start{sourceManager->isMacroLoc(case_start)} {}
 
         const Statement* stmt;
 
@@ -91,8 +86,6 @@ private:
         std::size_t case_start_column{};
 
         bool is_macro_case_start{};
-        bool is_macro_case_end{};
-        bool is_macro_stmt_end{};
     };
 
     void handleCase(const CaseStatement& stmt) {
@@ -115,9 +108,9 @@ private:
         }
 
         std::sort(cases.begin(), cases.end(), [this](const CaseLine& a, const CaseLine& b) {
-            return a.case_start_line > b.case_start_line ||
-                   (a.case_start_line == b.case_start_line &&
-                    a.case_start_line > b.case_start_line);
+            return !(
+                a.case_start_line > b.case_start_line ||
+                (a.case_start_line == b.case_start_line && a.case_start_line > b.case_start_line));
         });
 
         for (auto iter_cases = cases.begin(); iter_cases != cases.end(); iter_cases++) {
@@ -132,7 +125,6 @@ private:
 
             prev_stmt_kind = stmt.kind;
             prev_stmt_line = 0;
-            is_macro = iter_cases->is_macro_case_end;
             iter_cases->stmt->visit(*this);
         }
 
@@ -142,28 +134,27 @@ private:
 public:
     template<std::derived_from<Statement> TStatement>
     void handle(const TStatement& stmt) {
-
-        if (std::is_same_v<TStatement, StatementList>) {
-            visitDefault(stmt);
-            return;
-        }
-
-        if (std::is_same_v<TStatement, VariableDeclStatement> &&
-            prev_stmt_kind == StatementKind::VariableDeclaration) {
-            return;
-        }
-
         SourceLocation start{stmt.sourceRange.start()};
         SourceLocation end{stmt.sourceRange.end()};
 
         bool is_macro_start{sourceManager->isMacroLoc(start)};
-        bool is_macro_end{sourceManager->isMacroLoc(end)};
 
         std::size_t start_line{sourceManager->getLineNumber(start)};
         std::size_t end_line{sourceManager->getLineNumber(end)};
 
         std::size_t start_column{sourceManager->getColumnNumber(start)};
         std::size_t end_column{sourceManager->getColumnNumber(end)};
+
+        if (std::is_same_v<TStatement, VariableDeclStatement> &&
+            prev_stmt_kind == StatementKind::VariableDeclaration) {
+            prev_stmt_line = start_line;
+            return;
+        }
+
+        if constexpr (std::is_same_v<TStatement, StatementList>) {
+            visitDefault(stmt);
+            return;
+        }
 
         if constexpr (std::is_same_v<TStatement, BlockStatement>) {
             switch (prev_stmt_kind) {
@@ -176,13 +167,11 @@ public:
                 case StatementKind::DoWhileLoop:
                 case StatementKind::RepeatLoop:
                 case StatementKind::Timed:
-                    is_macro = is_macro_start;
                     prev_stmt_line = start_line;
                     prev_stmt_kind = stmt.kind;
 
                     visitDefault(stmt);
 
-                    is_macro = is_macro_end;
                     prev_stmt_line = end_line;
                     prev_stmt_kind = stmt.kind;
                     return;
@@ -198,21 +187,23 @@ public:
             diags.add(diag::NoOneLineMultiAssign, sourceManager->getExpansionLoc(start));
         }
 
-        is_macro = is_macro_start;
+        if constexpr (std::is_same_v<TStatement, ConditionalStatement>) {
+            handleConditional(stmt);
+            prev_stmt_line = end_line;
+            prev_stmt_kind = stmt.kind;
+            return;
+        }
+
         prev_stmt_line = start_line;
         prev_stmt_kind = stmt.kind;
 
-        if constexpr (std::is_same_v<TStatement, ConditionalStatement>) {
-            handleConditional(stmt);
-        }
-        else if constexpr (std::is_same_v<TStatement, CaseStatement>) {
+        if constexpr (std::is_same_v<TStatement, CaseStatement>) {
             handleCase(stmt);
         }
         else if constexpr (!std::is_same_v<TStatement, ExpressionStatement>) {
             visitDefault(stmt);
         }
 
-        is_macro = is_macro_end;
         prev_stmt_line = end_line;
         prev_stmt_kind = stmt.kind;
     }
@@ -222,7 +213,6 @@ public:
         SourceLocation end{expr.sourceRange.end()};
 
         bool is_macro_start{sourceManager->isMacroLoc(start)};
-        bool is_macro_end{sourceManager->isMacroLoc(end)};
 
         std::size_t start_line{sourceManager->getLineNumber(start)};
         std::size_t end_line{sourceManager->getLineNumber(end)};
@@ -233,11 +223,10 @@ public:
         if (!is_macro_start && prev_stmt_line == start_line) {
             diags.add(diag::NoOneLineMultiAssign, start);
         }
-        else if (is_macro_start &&  prev_stmt_line == start_line) {
+        else if (is_macro_start && prev_stmt_line == start_line) {
             diags.add(diag::NoOneLineMultiAssign, sourceManager->getExpansionLoc(start));
         }
 
-        is_macro = is_macro_end;
         prev_stmt_line = end_line;
     }
 };
@@ -265,8 +254,9 @@ public:
     std::string name() const override { return "NoOneLineMultiAssign"; }
     std::string description() const override { return shortDescription(); }
     std::string shortDescription() const override {
-        return "Enforces that multiple non hierarchically dependent statements "
-               "are not being described in one line ";
+        return "Multiple statements are describedin the single line. "
+               "Describe one statement per line to improve RTL "
+               "description readability.";
     }
 };
 
