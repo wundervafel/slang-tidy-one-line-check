@@ -1,9 +1,10 @@
 #include "ASTHelperVisitors.h"
 #include "TidyDiags.h"
 #include "fmt/color.h"
-// #include <iostream>
+#include <iostream>
 
 #include "slang/ast/ASTVisitor.h"
+#include "slang/ast/statements/LoopStatements.h"
 #include "slang/syntax/AllSyntax.h"
 
 using namespace slang;
@@ -131,6 +132,11 @@ private:
         prev_stmt_kind = stmt.kind;
     }
 
+    template<std::derived_from<Statement> TStatement>
+    void handleLoop(const TStatement& stmt) {
+        stmt.body.visit(*this);
+    }
+
 public:
     template<std::derived_from<Statement> TStatement>
     void handle(const TStatement& stmt) {
@@ -142,6 +148,7 @@ public:
         std::size_t start_line{sourceManager->getLineNumber(start)};
         std::size_t end_line{sourceManager->getLineNumber(end)};
 
+        std::cout << stmt.kind << ' ' << start_line << '\n';
         std::size_t start_column{sourceManager->getColumnNumber(start)};
         std::size_t end_column{sourceManager->getColumnNumber(end)};
 
@@ -193,6 +200,17 @@ public:
             prev_stmt_kind = stmt.kind;
             return;
         }
+        else if constexpr (std::is_same_v<TStatement, ForeachLoopStatement> ||
+                           std::is_same_v<TStatement, ForLoopStatement> ||
+                           std::is_same_v<TStatement, ForeverLoopStatement> ||
+                           std::is_same_v<TStatement, WhileLoopStatement> ||
+                           std::is_same_v<TStatement, DoWhileLoopStatement> ||
+                           std::is_same_v<TStatement, RepeatLoopStatement>) {
+            handleLoop(stmt);
+            prev_stmt_line = end_line;
+            prev_stmt_kind = stmt.kind;
+            return;
+        }
 
         prev_stmt_line = start_line;
         prev_stmt_kind = stmt.kind;
@@ -216,6 +234,7 @@ public:
 
         std::size_t start_line{sourceManager->getLineNumber(start)};
         std::size_t end_line{sourceManager->getLineNumber(end)};
+        std::cout << expr.kind << ' ' << start_line << '\n';
 
         std::size_t start_column{sourceManager->getColumnNumber(start)};
         std::size_t end_column{sourceManager->getColumnNumber(end)};

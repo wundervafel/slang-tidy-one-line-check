@@ -46,3 +46,28 @@ module top4 ();
         endcase
     end
 endmodule
+
+module top5 ();
+    logic a, b, c;
+    int k;
+    always @(posedge a) begin
+        for (int k = 1; k < 5; k = k + 1) a = a + 1;
+
+        for (int k = 1; k < 5; k = k + 1) begin
+            a = a + k;
+        end
+
+        for (int k = 1; k < 5; k = k + 1) begin a = a + k;
+        end
+
+        for (int k = 1; k < 5; k = k + 1) a = a + k; b = 1;
+    end
+endmodule
+
+module top6 ();
+    logic a, b, c;
+    int k = 8;
+    always @(posedge a) begin
+        while (k > 0) k = k - 1;
+    end
+endmodule
