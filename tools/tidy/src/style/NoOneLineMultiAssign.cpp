@@ -1,252 +1,498 @@
 #include "ASTHelperVisitors.h"
 #include "TidyDiags.h"
 #include "fmt/color.h"
-#include <iostream>
+#include <algorithm>
+#include <compare>
+#include <map>
 
 #include "slang/ast/ASTVisitor.h"
-#include "slang/ast/statements/LoopStatements.h"
 #include "slang/syntax/AllSyntax.h"
 
 using namespace slang;
 using namespace slang::ast;
 using namespace slang::syntax;
+using namespace slang::parsing;
 
 namespace no_one_line_multi_assign {
 
 struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, VisitFlags::AllGood> {
     explicit MainVisitor(Diagnostics& diagnostics) : TidyVisitor(diagnostics) {}
 
-private:
-    std::size_t prev_stmt_line{};
-    StatementKind prev_stmt_kind{StatementKind::Invalid};
+    void inspectLines() {
+        auto code_iter{loc_map.begin()};
+        while (code_iter != loc_map.end()) {
+            std::multiset<ExpandedLoc> line_loc;
+            std::size_t line{code_iter->first};
 
-    const SyntaxNode* elseSyntax(const ConditionalStatement& stmt) {
-        const SyntaxNode* syntax = stmt.syntax;
-        for (int i{0}; i < syntax->getChildCount(); i++) {
-            const SyntaxNode* child = syntax->childNode(i);
-            if (child && child->kind == SyntaxKind::ElseClause) {
-                return child;
-            }
-        }
+            auto lower_bound{loc_map.lower_bound(line)};
+            auto upper_bound{loc_map.upper_bound(line)};
+            std::for_each(lower_bound, upper_bound,
+                          [&line_loc](const auto& loc) { line_loc.insert(loc.second); });
 
-        return nullptr;
-    }
+            code_iter = upper_bound;
 
-    void handleConditional(const ConditionalStatement& stmt) {
-        const Statement& true_stmt = stmt.ifTrue;
-        true_stmt.visit(*this);
+            auto line_iter{line_loc.begin()};
+            ExpandedLoc prev_loc{*line_iter};
+            for (line_iter++; line_iter != line_loc.end(); prev_loc = *line_iter, line_iter++) {
+                if (*line_iter == prev_loc) {
+                    continue;
+                }
 
-        const Statement* false_stmt = stmt.ifFalse;
-        if (false_stmt) {
-            SourceLocation else_loc = elseSyntax(stmt)->sourceRange().start();
-            std::size_t else_line = sourceManager->getLineNumber(else_loc);
+                if (line_iter->kind == ExpandedLoc::BlockName ||
+                    line_iter->kind == ExpandedLoc::DoWhile ||
+                    line_iter->kind == ExpandedLoc::DoWhileEnd) {
+                    continue;
+                }
 
-            if (else_line == prev_stmt_line) {
-                diags.add(diag::NoOneLineMultiAssign, else_loc);
-            }
+                if (prev_loc.kind == prev_loc.If || prev_loc.kind == prev_loc.Else ||
+                    prev_loc.kind == prev_loc.DoWhileStart || prev_loc.kind == prev_loc.Type ||
+                    prev_loc.kind == prev_loc.CaseCond) {
+                    continue;
+                }
 
-            prev_stmt_kind = StatementKind::Conditional;
-            false_stmt->visit(*this);
-        }
-    }
-
-    // Случай по умолчанию ищем на первых двух уровнях дерева
-    const SyntaxNode* defaultCaseSyntax(const CaseStatement& stmt) {
-        const SyntaxNode* syntax = stmt.syntax;
-        for (int i{0}; i < syntax->getChildCount(); i++) {
-            const SyntaxNode* child = syntax->childNode(i);
-            if (child) {
-                for (int i{0}; i < child->getChildCount(); i++) {
-                    const SyntaxNode* grandchild = child->childNode(i);
-                    if (grandchild && grandchild->kind == SyntaxKind::DefaultCaseItem) {
-                        return grandchild;
+                if (prev_loc.kind == prev_loc.Statement) {
+                    StatementKind stmt_kind{prev_loc.source.stmt->kind};
+                    if (stmt_kind == StatementKind::RepeatLoop ||
+                        stmt_kind == StatementKind::WhileLoop ||
+                        stmt_kind == StatementKind::ForeverLoop ||
+                        stmt_kind == StatementKind::ForeachLoop ||
+                        stmt_kind == StatementKind::ForLoop) {
+                        continue;
                     }
+
+                    if (stmt_kind == StatementKind::VariableDeclaration &&
+                        line_iter->kind == line_iter->Statement &&
+                        line_iter->source.stmt->kind == StatementKind::VariableDeclaration) {
+                        continue;
+                    }
+                }
+
+                if (prev_loc.kind == prev_loc.Symbol) {
+                    SymbolKind symb_kind{prev_loc.source.symb->kind};
+                    if (symb_kind == SymbolKind::ProceduralBlock) {
+                        continue;
+                    }
+
+                    if (symb_kind == SymbolKind::Variable) {
+                        if (line_iter->kind == ExpandedLoc::Symbol &&
+                            line_iter->source.symb->kind == SymbolKind::Variable) {
+                            continue;
+                        }
+                    }
+                }
+
+                line_iter->addDiag(diags, sourceManager);
+            }
+        }
+    }
+
+    Token findIf(const ConditionalStatement& stmt) {
+        const auto& syntax{stmt.syntax->as<ConditionalStatementSyntax>()};
+        return syntax.ifKeyword;
+    }
+    Token findElse(const ConditionalStatement& stmt) {
+        const auto& syntax{stmt.syntax->as<ConditionalStatementSyntax>()};
+        const ElseClauseSyntax* else_syntax = syntax.elseClause;
+        if (!else_syntax) {
+            return Token{};
+        }
+
+        return else_syntax->elseKeyword;
+    }
+
+    struct ExpandedLoc {
+        bool is_macro{false};
+        SourceLocation loc;
+        SourceLocation orig_loc;
+
+        std::size_t line{};
+        std::size_t column{};
+        std::size_t offset{};
+
+        Token token;
+
+        enum LocKind {
+            Symbol,
+            Statement,
+            Expression,
+            CaseCond,
+            Endcase,
+            If,
+            Else,
+            BlockStart,
+            BlockEnd,
+            BlockName,
+            DoWhileStart,
+            DoWhileEnd,
+            DoWhile,
+            Type,
+        } kind{};
+
+        union {
+            const ast::Symbol* symb;
+            const ast::Statement* stmt;
+            const ast::Expression* expr;
+        } source{};
+
+        ExpandedLoc() noexcept = default;
+        ExpandedLoc(const ExpandedLoc&) = default;
+
+        ExpandedLoc(LocKind kind, const Token& token, const SourceLocation& orig_loc,
+                    const SourceManager* sourceManager) :
+            is_macro{sourceManager->isMacroLoc(orig_loc)},
+            loc{is_macro ? sourceManager->getFullyExpandedLoc(orig_loc) : orig_loc},
+            orig_loc{orig_loc}, line{sourceManager->getLineNumber(loc)},
+            column{sourceManager->getColumnNumber(loc)}, offset{loc.offset()}, token{token},
+            kind{kind} {}
+
+        template<typename TSource>
+        ExpandedLoc(TSource& source, LocKind kind, const Token& token,
+                    const SourceLocation& orig_loc, const SourceManager* sourceManager) :
+            ExpandedLoc(kind, token, orig_loc, sourceManager) {
+            if constexpr (std::is_base_of_v<ast::Symbol, TSource>) {
+                ExpandedLoc::source.symb = &source;
+            }
+            else if constexpr (std::is_base_of_v<ast::Statement, TSource>) {
+                ExpandedLoc::source.stmt = &source;
+            }
+            else if constexpr (std::is_base_of_v<ast::Expression, TSource>) {
+                ExpandedLoc::source.expr = &source;
+            }
+        }
+
+        inline bool isDifferentMacro(const ExpandedLoc& other) const noexcept {
+            return is_macro && other.is_macro && offset != other.offset;
+        }
+
+        void addDiag(Diagnostics& diags, const SourceManager* sourceManager) const {
+            SourceLocation final_loc{!is_macro ? loc : sourceManager->getExpansionLoc(orig_loc)};
+            diags.add(diag::NoOneLineMultiAssign, final_loc);
+        }
+
+        friend std::strong_ordering operator<=>(const ExpandedLoc& a,
+                                                const ExpandedLoc& b) noexcept {
+            if (a.offset < b.offset) {
+                return std::strong_ordering::less;
+            }
+            if (a.offset > b.offset) {
+                return std::strong_ordering::greater;
+            }
+            return std::strong_ordering::equivalent;
+        }
+
+        friend bool operator==(const ExpandedLoc& a, const ExpandedLoc& b) noexcept {
+            return (a <=> b) == 0;
+        }
+    };
+
+    std::multimap<std::size_t, ExpandedLoc> loc_map;
+
+    template<std::derived_from<Symbol> TSymbol>
+    void handle(const TSymbol& symb) {
+        visitDefault(symb);
+    }
+
+    void handle(const StatementBlockSymbol&) {};
+
+    void handle(const VariableSymbol& symb) {
+        const auto& var_syntax{symb.getSyntax()->as<DataDeclarationSyntax>()};
+        const DataTypeSyntax& type_syntax{*symb.getDeclaredType()->getTypeSyntax()};
+
+        Token first_token{var_syntax.getFirstToken()};
+        Token last_token{var_syntax.getLastToken()};
+
+        ExpandedLoc start_loc{symb, start_loc.Symbol, first_token, first_token.location(),
+                              sourceManager};
+        ExpandedLoc end_loc{symb, end_loc.Symbol, last_token, last_token.location(), sourceManager};
+
+        loc_map.emplace(start_loc.line, start_loc);
+        if (start_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
+        }
+
+        Token type_token{type_syntax.getFirstToken()};
+        ExpandedLoc type_loc{type_loc.Type, type_token, type_token.location(), sourceManager};
+        loc_map.emplace(type_loc.line, type_loc);
+    }
+
+    void handle(const ProceduralBlockSymbol& symb) {
+        ExpandedLoc loc{symb, loc.Symbol, symb.getSyntax()->getFirstToken(), symb.location,
+                        sourceManager};
+        loc_map.emplace(loc.line, loc);
+
+        const Statement* body = &symb.getBody();
+        if (body->kind == StatementKind::Timed) {
+            body = &body->as<TimedStatement>().stmt;
+        }
+        body->visit(*this);
+    }
+
+    void handle(const PrimitiveInstanceSymbol& symb) {
+        Token first_token{symb.getSyntax()->getFirstToken()};
+        Token last_token{symb.getSyntax()->getLastToken()};
+
+        ExpandedLoc start_loc{symb, start_loc.Symbol, first_token, first_token.location(),
+                              sourceManager};
+        ExpandedLoc end_loc{symb, end_loc.Symbol, last_token, last_token.location(), sourceManager};
+
+        loc_map.emplace(start_loc.line, start_loc);
+        if (start_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
+        }
+    }
+
+    void handle(const ContinuousAssignSymbol& symb) {
+        const auto& syntax{symb.getSyntax()->as<ContinuousAssignSyntax>()};
+
+        Token assign{syntax.assign};
+        ExpandedLoc assign_loc{symb, assign_loc.Symbol, assign, assign.location(), sourceManager};
+        loc_map.emplace(assign_loc.line, assign_loc);
+
+        symb.getAssignment().visit(*this);
+    }
+
+    template<std::derived_from<Statement> TStatement>
+    void handle(const TStatement& stmt) {
+        if (!stmt.syntax) {
+            visitDefault(stmt);
+            return;
+        }
+
+        Token first_token{stmt.syntax->getFirstToken()};
+        Token last_token{stmt.syntax->getLastToken()};
+
+        ExpandedLoc start_loc{stmt, start_loc.Statement, first_token, first_token.location(),
+                              sourceManager};
+        ExpandedLoc end_loc{stmt, end_loc.Statement, last_token, last_token.location(),
+                            sourceManager};
+        loc_map.emplace(start_loc.line, start_loc);
+        if (start_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
+        }
+    }
+
+    void handle(const ConditionalStatement& stmt) {
+        Token if_token{findIf(stmt)};
+
+        ExpandedLoc if_loc{stmt, if_loc.If, if_token, if_token.location(), sourceManager};
+        loc_map.emplace(if_loc.line, if_loc);
+
+        stmt.ifTrue.visit(*this);
+
+        if (stmt.ifFalse) {
+            Token else_token{findElse(stmt)};
+            ExpandedLoc else_loc{stmt, else_loc.Else, else_token, else_token.location(),
+                                 sourceManager};
+
+            loc_map.emplace(else_loc.line, else_loc);
+
+            stmt.ifFalse->visit(*this);
+        }
+    }
+
+    void handle(const VariableDeclStatement& stmt) { stmt.symbol.visit(*this); }
+
+    void handle(const CaseStatement& stmt) {
+        Token first_token{stmt.syntax->getFirstToken()};
+        Token last_token{stmt.syntax->getLastToken()};
+
+        ExpandedLoc start_loc{stmt, start_loc.Statement, first_token, first_token.location(),
+                              sourceManager};
+        ExpandedLoc end_loc{end_loc.Endcase, last_token, last_token.location(), sourceManager};
+
+        loc_map.emplace(start_loc.line, start_loc);
+        loc_map.emplace(end_loc.line, end_loc);
+
+        const auto& syntax{stmt.syntax->as<CaseStatementSyntax>()};
+        for (const auto& item : syntax.items) {
+            Token case_cond;
+            Token colon;
+
+            if (item->kind == SyntaxKind::DefaultCaseItem) {
+                const auto& condition{item->as<DefaultCaseItemSyntax>()};
+                case_cond = condition.defaultKeyword;
+                colon = condition.colon;
+            }
+            else if (item->kind == SyntaxKind::StandardCaseItem) {
+                const auto& condition{item->as<StandardCaseItemSyntax>()};
+                case_cond = condition.getFirstToken();
+                colon = condition.colon;
+            }
+            else {
+                const auto& condition{item->as<PatternCaseItemSyntax>()};
+                case_cond = condition.getFirstToken();
+                colon = condition.colon;
+            }
+
+            ExpandedLoc case_loc{case_loc.CaseCond, case_cond, case_cond.location(), sourceManager};
+            ExpandedLoc colon_loc{colon_loc.CaseCond, colon, colon.location(), sourceManager};
+
+            loc_map.emplace(case_loc.line, case_loc);
+            if (case_loc.line != colon_loc.line) {
+                loc_map.emplace(colon_loc.line, colon_loc);
+            }
+        }
+
+        stmt.visitStmts(*this);
+    }
+
+    void handle(const StatementList& stmt) { visitDefault(stmt); }
+
+    void handle(const BlockStatement& stmt) {
+        Token first_token = stmt.syntax->getFirstToken();
+        if (first_token.kind == TokenKind::BeginKeyword ||
+            first_token.kind == TokenKind::ForkKeyword) {
+
+            Token last_token = stmt.syntax->getLastToken();
+
+            ExpandedLoc start_loc{start_loc.BlockStart, first_token, first_token.location(),
+                                  sourceManager};
+            ExpandedLoc end_loc{end_loc.BlockEnd, last_token, last_token.location(), sourceManager};
+
+            loc_map.emplace(start_loc.line, start_loc);
+            if (start_loc.line != end_loc.line) {
+                loc_map.emplace(end_loc.line, end_loc);
+            }
+
+            const auto* name = stmt.syntax->as<BlockStatementSyntax>().blockName;
+            if (name) {
+                Token name_token = name->name;
+                ExpandedLoc name_loc{name_loc.BlockName, name_token, name_token.location(),
+                                     sourceManager};
+                if (start_loc.line != name_loc.line) {
+                    loc_map.emplace(name_loc.line, name_loc);
+                }
+            }
+
+            visitDefault(stmt);
+        }
+        else if (first_token.kind == TokenKind::ForKeyword) {
+            // Ищем ForLoopStatement в списке
+            const auto& list{stmt.body.as<StatementList>().list};
+            for (const auto& entry : list) {
+                if (entry->kind == StatementKind::ForLoop) {
+                    entry->visit(*this);
                 }
             }
         }
-
-        return nullptr;
     }
 
-    struct CaseLine {
-        CaseLine(SourceLocation case_start, SourceLocation case_end, const Statement* stmt,
-                 const SourceManager* sourceManager) :
-            stmt{stmt}, case_start{case_start},
-            case_start_line{sourceManager->getLineNumber(case_start)},
-            case_end_line{sourceManager->getLineNumber(case_end)},
-            case_start_column{sourceManager->getColumnNumber(case_start)},
-            is_macro_case_start{sourceManager->isMacroLoc(case_start)} {}
+    void handle(const ForLoopStatement& stmt) {
+        const auto& syntax{stmt.syntax->as<ForLoopStatementSyntax>()};
+        Token start_token{syntax.forKeyword};
+        Token end_token{syntax.closeParen};
 
-        const Statement* stmt;
+        ExpandedLoc start_loc(stmt, start_loc.Statement, start_token, start_token.location(),
+                              sourceManager);
+        ExpandedLoc end_loc(stmt, end_loc.Statement, end_token, end_token.location(),
+                            sourceManager);
 
-        SourceLocation case_start{};
-
-        std::size_t case_start_line{};
-        std::size_t case_end_line{};
-
-        std::size_t case_start_column{};
-
-        bool is_macro_case_start{};
-    };
-
-    void handleCase(const CaseStatement& stmt) {
-        std::vector<CaseLine> cases;
-
-        const Statement* default_stmt = stmt.defaultCase;
-        if (default_stmt) {
-            SourceLocation default_start = defaultCaseSyntax(stmt)->sourceRange().start();
-            SourceLocation default_case_end = default_start;
-
-            cases.push_back({default_start, default_case_end, default_stmt, sourceManager});
+        loc_map.emplace(start_loc.line, start_loc);
+        if (start_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
         }
 
-        for (auto iter_items{stmt.items.begin()}; iter_items != stmt.items.end(); iter_items++) {
-            const Statement& item_stmt{*iter_items->stmt.get()};
-            SourceLocation start_loc{iter_items->expressions.front()->sourceRange.start()};
-            SourceLocation case_end_loc{iter_items->expressions.back()->sourceRange.end()};
-
-            cases.push_back({start_loc, case_end_loc, iter_items->stmt, sourceManager});
-        }
-
-        std::sort(cases.begin(), cases.end(), [this](const CaseLine& a, const CaseLine& b) {
-            return !(
-                a.case_start_line > b.case_start_line ||
-                (a.case_start_line == b.case_start_line && a.case_start_line > b.case_start_line));
-        });
-
-        for (auto iter_cases = cases.begin(); iter_cases != cases.end(); iter_cases++) {
-            if (!iter_cases->is_macro_case_start && iter_cases->case_start_line == prev_stmt_line) {
-                diags.add(diag::NoOneLineMultiAssign, iter_cases->case_start);
-            }
-            else if (iter_cases->is_macro_case_start &&
-                     iter_cases->case_start_line == prev_stmt_line) {
-                diags.add(diag::NoOneLineMultiAssign,
-                          sourceManager->getExpansionLoc(iter_cases->case_start));
-            }
-
-            prev_stmt_kind = stmt.kind;
-            prev_stmt_line = 0;
-            iter_cases->stmt->visit(*this);
-        }
-
-        prev_stmt_kind = stmt.kind;
+        stmt.visitStmts(*this);
     }
 
-    template<std::derived_from<Statement> TStatement>
-    void handleLoop(const TStatement& stmt) {
-        stmt.body.visit(*this);
+    void handle(const ForeachLoopStatement& stmt) {
+        const auto& syntax{stmt.syntax->as<ForeachLoopStatementSyntax>()};
+        Token start_token{syntax.keyword};
+        Token end_token{syntax.loopList->closeParen};
+
+        ExpandedLoc start_loc(stmt, start_loc.Statement, start_token, start_token.location(),
+                              sourceManager);
+        ExpandedLoc end_loc(stmt, end_loc.Statement, end_token, end_token.location(),
+                            sourceManager);
+
+        loc_map.emplace(start_loc.line, start_loc);
+        if (start_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
+        }
+
+        stmt.visitStmts(*this);
     }
 
-public:
-    template<std::derived_from<Statement> TStatement>
-    void handle(const TStatement& stmt) {
-        SourceLocation start{stmt.sourceRange.start()};
-        SourceLocation end{stmt.sourceRange.end()};
+    void handle(const ForeverLoopStatement& stmt) {
+        Token start_token{stmt.syntax->getFirstToken()};
+        ExpandedLoc start_loc(stmt, start_loc.Statement, start_token, start_token.location(),
+                              sourceManager);
+        loc_map.emplace(start_loc.line, start_loc);
+        stmt.visitStmts(*this);
+    }
 
-        bool is_macro_start{sourceManager->isMacroLoc(start)};
+    void handle(const RepeatLoopStatement& stmt) {
+        const auto& syntax{stmt.syntax->as<LoopStatementSyntax>()};
+        Token start_token{syntax.repeatOrWhile};
+        Token end_token{syntax.closeParen};
 
-        std::size_t start_line{sourceManager->getLineNumber(start)};
-        std::size_t end_line{sourceManager->getLineNumber(end)};
+        ExpandedLoc start_loc(stmt, start_loc.Statement, start_token, start_token.location(),
+                              sourceManager);
+        ExpandedLoc end_loc(stmt, end_loc.Statement, end_token, end_token.location(),
+                            sourceManager);
 
-        std::cout << stmt.kind << ' ' << start_line << '\n';
-        std::size_t start_column{sourceManager->getColumnNumber(start)};
-        std::size_t end_column{sourceManager->getColumnNumber(end)};
-
-        if (std::is_same_v<TStatement, VariableDeclStatement> &&
-            prev_stmt_kind == StatementKind::VariableDeclaration) {
-            prev_stmt_line = start_line;
-            return;
+        loc_map.emplace(start_loc.line, start_loc);
+        if (start_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
         }
 
-        if constexpr (std::is_same_v<TStatement, StatementList>) {
-            visitDefault(stmt);
-            return;
+        stmt.visitStmts(*this);
+    }
+
+    void handle(const WhileLoopStatement& stmt) {
+        const auto& syntax{stmt.syntax->as<LoopStatementSyntax>()};
+        Token start_token{syntax.repeatOrWhile};
+        Token end_token{syntax.closeParen};
+
+        ExpandedLoc start_loc(stmt, start_loc.Statement, start_token, start_token.location(),
+                              sourceManager);
+        ExpandedLoc end_loc(stmt, end_loc.Statement, end_token, end_token.location(),
+                            sourceManager);
+
+        loc_map.emplace(start_loc.line, start_loc);
+        if (start_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
         }
 
-        if constexpr (std::is_same_v<TStatement, BlockStatement>) {
-            switch (prev_stmt_kind) {
-                case StatementKind::Case:
-                case StatementKind::Conditional:
-                case StatementKind::ForLoop:
-                case StatementKind::ForeverLoop:
-                case StatementKind::ForeachLoop:
-                case StatementKind::WhileLoop:
-                case StatementKind::DoWhileLoop:
-                case StatementKind::RepeatLoop:
-                case StatementKind::Timed:
-                    prev_stmt_line = start_line;
-                    prev_stmt_kind = stmt.kind;
+        stmt.visitStmts(*this);
+    }
 
-                    visitDefault(stmt);
+    void handle(const DoWhileLoopStatement& stmt) {
+        const auto& syntax{stmt.syntax->as<DoWhileStatementSyntax>()};
+        Token start_token{syntax.doKeyword};
+        Token while_token{syntax.whileKeyword};
+        Token end_token{syntax.getLastToken()};
 
-                    prev_stmt_line = end_line;
-                    prev_stmt_kind = stmt.kind;
-                    return;
-                default:
-                    break;
-            }
+        ExpandedLoc start_loc(start_loc.DoWhileStart, start_token, start_token.location(),
+                              sourceManager);
+        ExpandedLoc while_loc(while_loc.DoWhile, while_token, while_token.location(),
+                              sourceManager);
+        ExpandedLoc end_loc(end_loc.DoWhileEnd, end_token, end_token.location(), sourceManager);
+
+        loc_map.emplace(start_loc.line, start_loc);
+        loc_map.emplace(while_loc.line, while_loc);
+        if (while_loc.line != end_loc.line) {
+            loc_map.emplace(end_loc.line, end_loc);
         }
 
-        if (!is_macro_start && prev_stmt_line == start_line) {
-            diags.add(diag::NoOneLineMultiAssign, start);
-        }
-        else if (is_macro_start && prev_stmt_line == start_line) {
-            diags.add(diag::NoOneLineMultiAssign, sourceManager->getExpansionLoc(start));
-        }
-
-        if constexpr (std::is_same_v<TStatement, ConditionalStatement>) {
-            handleConditional(stmt);
-            prev_stmt_line = end_line;
-            prev_stmt_kind = stmt.kind;
-            return;
-        }
-        else if constexpr (std::is_same_v<TStatement, ForeachLoopStatement> ||
-                           std::is_same_v<TStatement, ForLoopStatement> ||
-                           std::is_same_v<TStatement, ForeverLoopStatement> ||
-                           std::is_same_v<TStatement, WhileLoopStatement> ||
-                           std::is_same_v<TStatement, DoWhileLoopStatement> ||
-                           std::is_same_v<TStatement, RepeatLoopStatement>) {
-            handleLoop(stmt);
-            prev_stmt_line = end_line;
-            prev_stmt_kind = stmt.kind;
-            return;
-        }
-
-        prev_stmt_line = start_line;
-        prev_stmt_kind = stmt.kind;
-
-        if constexpr (std::is_same_v<TStatement, CaseStatement>) {
-            handleCase(stmt);
-        }
-        else if constexpr (!std::is_same_v<TStatement, ExpressionStatement>) {
-            visitDefault(stmt);
-        }
-
-        prev_stmt_line = end_line;
-        prev_stmt_kind = stmt.kind;
+        stmt.visitStmts(*this);
     }
 
     void handle(const AssignmentExpression& expr) {
-        SourceLocation start{expr.sourceRange.start()};
-        SourceLocation end{expr.sourceRange.end()};
+        const SyntaxNode* syntax{expr.syntax};
+        if (syntax) {
+            Token first_token{expr.syntax->getFirstToken()};
+            Token last_token{expr.syntax->getLastToken()};
 
-        bool is_macro_start{sourceManager->isMacroLoc(start)};
-
-        std::size_t start_line{sourceManager->getLineNumber(start)};
-        std::size_t end_line{sourceManager->getLineNumber(end)};
-        std::cout << expr.kind << ' ' << start_line << '\n';
-
-        std::size_t start_column{sourceManager->getColumnNumber(start)};
-        std::size_t end_column{sourceManager->getColumnNumber(end)};
-
-        if (!is_macro_start && prev_stmt_line == start_line) {
-            diags.add(diag::NoOneLineMultiAssign, start);
+            ExpandedLoc start_loc{expr, start_loc.Expression, first_token, first_token.location(),
+                                  sourceManager};
+            ExpandedLoc end_loc{expr, end_loc.Expression, last_token, last_token.location(),
+                                sourceManager};
+            loc_map.emplace(start_loc.line, start_loc);
+            if (start_loc.line != end_loc.line) {
+                loc_map.emplace(end_loc.line, end_loc);
+            }
         }
-        else if (is_macro_start && prev_stmt_line == start_line) {
-            diags.add(diag::NoOneLineMultiAssign, sourceManager->getExpansionLoc(start));
-        }
-
-        prev_stmt_line = end_line;
     }
 };
 } // namespace no_one_line_multi_assign
@@ -261,6 +507,7 @@ public:
     bool check(const ast::RootSymbol& root, const slang::analysis::AnalysisManager&) override {
         MainVisitor visitor(diagnostics);
         root.visit(visitor);
+        visitor.inspectLines();
         return diagnostics.empty();
     }
 
